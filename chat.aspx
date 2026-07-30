@@ -1,98 +1,49 @@
-<%@ Page Language="C#" AutoEventWireup="true" %>
+<%@ Page Language="C#" AutoEventWireup="true" CodePage="65001" ResponseEncoding="utf-8" %>
 <%@ Import Namespace="System" %>
+<%@ Import Namespace="System.Globalization" %>
 <%@ Import Namespace="System.IO" %>
+<%@ Import Namespace="System.Runtime.InteropServices" %>
 <%@ Import Namespace="System.Text" %>
 <%@ Import Namespace="System.Web" %>
-<%@ Import Namespace="System.Web.UI" %>
-<%@ Import Namespace="System.Runtime.InteropServices" %>
-<%@ Import Namespace="System.Globalization" %>
 
 <script runat="server">
-    // ============================================================
-    // LAN内 iPad向け 写真共有ページ
-    // 対象: IIS + ASP.NET Web Forms (.NET Framework 4.8 推奨)
-    // DB  : Windows標準 winsqlite3.dll
-    // ============================================================
-
     private const int SQLITE_OK = 0;
-    private const int SQLITE_BUSY = 5;
     private const int SQLITE_ROW = 100;
     private const int SQLITE_DONE = 101;
-
-    private const int SQLITE_OPEN_READWRITE = 0x00000002;
-    private const int SQLITE_OPEN_CREATE = 0x00000004;
-    private const int SQLITE_OPEN_FULLMUTEX = 0x00010000;
-
-    private const int MAX_FILE_SIZE = 15 * 1024 * 1024; // 15MB
-    private const int BUSY_TIMEOUT_MS = 5000;
-
+    private const int MAX_FILE_SIZE = 15 * 1024 * 1024;
     private static readonly IntPtr SQLITE_TRANSIENT = new IntPtr(-1);
-    private static readonly object DatabaseInitLock = new object();
+
+    private static readonly object InitLock = new object();
     private static readonly object CleanupLock = new object();
-    private static bool databaseInitialized = false;
+    private static bool databaseInitialized;
     private static DateTime lastCleanupDate = DateTime.MinValue;
 
     private string dbPath;
-    private bool requestHandled;
+    private bool suppressPageRender;
 
     [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
-    private static extern int sqlite3_open_v2(
-        byte[] filename,
-        out IntPtr db,
-        int flags,
-        IntPtr zVfs
-    );
+    private static extern int sqlite3_open16(
+        [MarshalAs(UnmanagedType.LPWStr)] string filename,
+        out IntPtr db);
 
     [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern int sqlite3_close(IntPtr db);
 
     [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern int sqlite3_exec(
-        IntPtr db,
-        string sql,
-        IntPtr callback,
-        IntPtr arg,
-        out IntPtr errmsg
-    );
-
-    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
-    private static extern void sqlite3_free(IntPtr ptr);
-
-    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
-    private static extern IntPtr sqlite3_errmsg(IntPtr db);
-
-    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
-    private static extern int sqlite3_busy_timeout(IntPtr db, int milliseconds);
+        IntPtr db, string sql, IntPtr callback, IntPtr arg, out IntPtr errmsg);
 
     [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern int sqlite3_prepare_v2(
-        IntPtr db,
-        string sql,
-        int numBytes,
-        out IntPtr stmt,
-        IntPtr tail
-    );
+        IntPtr db, string sql, int numBytes, out IntPtr stmt, IntPtr tail);
 
     [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern int sqlite3_bind_blob(
-        IntPtr stmt,
-        int index,
-        byte[] value,
-        int numBytes,
-        IntPtr destructor
-    );
+        IntPtr stmt, int index, byte[] value, int numBytes, IntPtr destructor);
 
     [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern int sqlite3_bind_text(
-        IntPtr stmt,
-        int index,
-        byte[] value,
-        int numBytes,
-        IntPtr destructor
-    );
-
-    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
-    private static extern int sqlite3_bind_int64(IntPtr stmt, int index, long value);
+        IntPtr stmt, int index, byte[] value, int numBytes, IntPtr destructor);
 
     [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern int sqlite3_step(IntPtr stmt);
@@ -109,113 +60,90 @@
     [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr sqlite3_column_text(IntPtr stmt, int column);
 
+    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern long sqlite3_last_insert_rowid(IntPtr db);
+
+    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int sqlite3_busy_timeout(IntPtr db, int milliseconds);
+
+    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr sqlite3_errmsg(IntPtr db);
+
+    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void sqlite3_free(IntPtr pointer);
+
     protected void Page_Load(object sender, EventArgs e)
     {
         try
         {
-            string appDataPath = Server.MapPath("~/App_Data");
-            Directory.CreateDirectory(appDataPath);
-            dbPath = Path.Combine(appDataPath, "photo_share.db");
+            string dataDirectory = Server.MapPath("~/App_Data");
+            Directory.CreateDirectory(dataDirectory);
+            dbPath = Path.Combine(dataDirectory, "photo_share.db");
 
-            EnsureDatabase();
-            CleanupOldFilesOncePerDay();
+            EnsureDatabaseCreated();
 
             string token = Request.QueryString["token"];
-
-            if (string.Equals(Request.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase)
-                && !string.IsNullOrWhiteSpace(token))
+            if (String.Equals(Request.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase)
+                && !String.IsNullOrEmpty(token))
             {
-                requestHandled = true;
+                suppressPageRender = true;
                 ServeFile(token);
-                CompleteRequest();
+                Context.ApplicationInstance.CompleteRequest();
                 return;
             }
 
-            if (string.Equals(Request.HttpMethod, "POST", StringComparison.OrdinalIgnoreCase))
+            if (String.Equals(Request.HttpMethod, "POST", StringComparison.OrdinalIgnoreCase))
             {
-                requestHandled = true;
+                suppressPageRender = true;
                 HandleFileUpload();
-                CompleteRequest();
+                Context.ApplicationInstance.CompleteRequest();
                 return;
             }
-        }
-        catch (DllNotFoundException)
-        {
-            requestHandled = true;
-            WriteJsonError(500, "winsqlite3.dllを読み込めません。対応するWindows環境で実行してください。");
-            CompleteRequest();
-        }
-        catch (BadImageFormatException)
-        {
-            requestHandled = true;
-            WriteJsonError(500, "winsqlite3.dllの32bit/64bit構成がIISと一致していません。");
-            CompleteRequest();
+
+            CleanupOldFilesOncePerDay();
         }
         catch (Exception ex)
         {
-            requestHandled = true;
             LogError(ex);
-            WriteJsonError(500, "サーバーの初期化に失敗しました。");
-            CompleteRequest();
+            if (IsPostBack || String.Equals(Request.HttpMethod, "POST", StringComparison.OrdinalIgnoreCase))
+            {
+                suppressPageRender = true;
+                WriteJsonError(500, "サーバーの初期化に失敗しました。");
+                Context.ApplicationInstance.CompleteRequest();
+            }
+            else
+            {
+                throw;
+            }
         }
     }
 
-    // CompleteRequestだけでは通常のページ描画を止めないため、
-    // JSONまたは画像を返した要求ではHTMLを追加出力しない。
-    protected override void Render(HtmlTextWriter writer)
+    protected override void Render(System.Web.UI.HtmlTextWriter writer)
     {
-        if (!requestHandled)
+        if (!suppressPageRender)
         {
             base.Render(writer);
         }
     }
 
-    private void CompleteRequest()
+    private int OpenDatabase(out IntPtr db)
     {
-        Context.ApplicationInstance.CompleteRequest();
+        int result = sqlite3_open16(dbPath, out db);
+        if (result == SQLITE_OK)
+        {
+            sqlite3_busy_timeout(db, 5000);
+        }
+        return result;
     }
 
-    private IntPtr OpenDatabase()
-    {
-        IntPtr db = IntPtr.Zero;
-        byte[] pathBytes = Utf8NullTerminated(dbPath);
-
-        int result = sqlite3_open_v2(
-            pathBytes,
-            out db,
-            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-            IntPtr.Zero
-        );
-
-        if (result != SQLITE_OK)
-        {
-            string detail = db == IntPtr.Zero ? "DBハンドルを取得できませんでした。" : GetSqliteError(db);
-            if (db != IntPtr.Zero)
-            {
-                sqlite3_close(db);
-            }
-            throw new InvalidOperationException("SQLiteデータベースを開けません。" + detail + " (code=" + result + ")");
-        }
-
-        int timeoutResult = sqlite3_busy_timeout(db, BUSY_TIMEOUT_MS);
-        if (timeoutResult != SQLITE_OK)
-        {
-            string detail = GetSqliteError(db);
-            sqlite3_close(db);
-            throw new InvalidOperationException("SQLite busy_timeoutの設定に失敗しました。" + detail);
-        }
-
-        return db;
-    }
-
-    private void EnsureDatabase()
+    private void EnsureDatabaseCreated()
     {
         if (databaseInitialized)
         {
             return;
         }
 
-        lock (DatabaseInitLock)
+        lock (InitLock)
         {
             if (databaseInitialized)
             {
@@ -225,28 +153,26 @@
             IntPtr db = IntPtr.Zero;
             try
             {
-                db = OpenDatabase();
+                int result = OpenDatabase(out db);
+                if (result != SQLITE_OK)
+                {
+                    throw new InvalidOperationException(
+                        "SQLiteデータベースを開けません。コード: " + result.ToString(CultureInfo.InvariantCulture));
+                }
 
                 ExecuteSql(db, "PRAGMA journal_mode=WAL;");
                 ExecuteSql(db, "PRAGMA synchronous=NORMAL;");
-
-                ExecuteSql(
-                    db,
+                ExecuteSql(db,
                     "CREATE TABLE IF NOT EXISTS PhotoFiles (" +
-                    "id INTEGER PRIMARY KEY AUTOINCREMENT," +
-                    "public_token TEXT NOT NULL UNIQUE," +
-                    "filename TEXT NOT NULL," +
-                    "content_type TEXT NOT NULL," +
-                    "file_data BLOB NOT NULL," +
-                    "created_at INTEGER NOT NULL" +
-                    ");"
-                );
-
-                ExecuteSql(
-                    db,
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+                    "public_token TEXT NOT NULL UNIQUE, " +
+                    "filename TEXT NOT NULL, " +
+                    "content_type TEXT NOT NULL, " +
+                    "file_data BLOB NOT NULL, " +
+                    "created_at TEXT NOT NULL);");
+                ExecuteSql(db,
                     "CREATE INDEX IF NOT EXISTS IX_PhotoFiles_CreatedAt " +
-                    "ON PhotoFiles(created_at);"
-                );
+                    "ON PhotoFiles(created_at);");
 
                 databaseInitialized = true;
             }
@@ -277,53 +203,34 @@
 
             IntPtr db = IntPtr.Zero;
             IntPtr stmt = IntPtr.Zero;
-
             try
             {
-                db = OpenDatabase();
-
-                // 当日00:00より前を削除する。
-                long cutoff = ToUnixTimeSeconds(today);
+                CheckResult(OpenDatabase(out db), db, "データベースを開く処理");
                 const string sql = "DELETE FROM PhotoFiles WHERE created_at < ?;";
+                CheckResult(sqlite3_prepare_v2(db, sql, -1, out stmt, IntPtr.Zero),
+                    db, "削除処理の準備");
 
-                CheckSqlite(
-                    sqlite3_prepare_v2(db, sql, -1, out stmt, IntPtr.Zero),
-                    db,
-                    "古い画像削除の準備"
-                );
-
-                CheckSqlite(
-                    sqlite3_bind_int64(stmt, 1, cutoff),
-                    db,
-                    "削除基準日時の設定"
-                );
+                byte[] boundary = Utf8(today.ToString("yyyy-MM-dd HH:mm:ss",
+                    CultureInfo.InvariantCulture));
+                CheckResult(sqlite3_bind_text(stmt, 1, boundary, boundary.Length, SQLITE_TRANSIENT),
+                    db, "削除日時の設定");
 
                 int stepResult = sqlite3_step(stmt);
                 if (stepResult != SQLITE_DONE)
                 {
-                    throw new InvalidOperationException(
-                        "古い画像の削除に失敗しました。" + GetSqliteError(db) +
-                        " (code=" + stepResult + ")"
-                    );
+                    throw new InvalidOperationException("古い画像の削除に失敗しました: " + GetSqliteError(db));
                 }
 
                 lastCleanupDate = today;
             }
             catch (Exception ex)
             {
-                // 清掃失敗で本体機能を停止させない。
                 LogError(ex);
             }
             finally
             {
-                if (stmt != IntPtr.Zero)
-                {
-                    sqlite3_finalize(stmt);
-                }
-                if (db != IntPtr.Zero)
-                {
-                    sqlite3_close(db);
-                }
+                if (stmt != IntPtr.Zero) sqlite3_finalize(stmt);
+                if (db != IntPtr.Zero) sqlite3_close(db);
             }
         }
     }
@@ -334,12 +241,9 @@
         Response.ContentType = "application/json; charset=utf-8";
         Response.Cache.SetCacheability(HttpCacheability.NoCache);
         Response.Cache.SetNoStore();
-        Response.TrySkipIisCustomErrors = true;
-        Response.AddHeader("X-Content-Type-Options", "nosniff");
 
         IntPtr db = IntPtr.Zero;
         IntPtr stmt = IntPtr.Zero;
-
         try
         {
             if (Request.Files.Count == 0)
@@ -367,77 +271,54 @@
             }
 
             byte[] fileBytes = ReadAllBytes(file.InputStream, MAX_FILE_SIZE);
-            string detectedContentType = DetectImageContentType(fileBytes);
-
-            if (detectedContentType == null)
+            string contentType = DetectImageContentType(fileBytes);
+            if (contentType == null)
             {
                 WriteJsonError(415, "JPEGまたはPNG画像のみ送信できます。");
                 return;
             }
 
-            string originalName = Path.GetFileName(file.FileName ?? string.Empty);
-            if (string.IsNullOrWhiteSpace(originalName))
-            {
-                originalName = detectedContentType == "image/png" ? "image.png" : "image.jpg";
-            }
-
-            // 極端に長いファイル名を保存しない。
-            if (originalName.Length > 255)
-            {
-                string extension = detectedContentType == "image/png" ? ".png" : ".jpg";
-                originalName = originalName.Substring(0, 240) + extension;
-            }
-
+            string originalName = SanitizeFileName(file.FileName, contentType);
             string publicToken = Guid.NewGuid().ToString("N");
-            long createdAt = ToUnixTimeSeconds(DateTime.Now);
 
-            db = OpenDatabase();
-
+            CheckResult(OpenDatabase(out db), db, "データベースを開く処理");
             const string sql =
                 "INSERT INTO PhotoFiles " +
                 "(public_token, filename, content_type, file_data, created_at) " +
                 "VALUES (?, ?, ?, ?, ?);";
+            CheckResult(sqlite3_prepare_v2(db, sql, -1, out stmt, IntPtr.Zero),
+                db, "保存処理の準備");
 
-            CheckSqlite(
-                sqlite3_prepare_v2(db, sql, -1, out stmt, IntPtr.Zero),
-                db,
-                "画像保存処理の準備"
-            );
-
-            BindText(stmt, 1, publicToken, db, "公開トークン");
-            BindText(stmt, 2, originalName, db, "ファイル名");
-            BindText(stmt, 3, detectedContentType, db, "画像形式");
-
-            CheckSqlite(
-                sqlite3_bind_blob(stmt, 4, fileBytes, fileBytes.Length, SQLITE_TRANSIENT),
-                db,
-                "画像データの設定"
-            );
-
-            CheckSqlite(
-                sqlite3_bind_int64(stmt, 5, createdAt),
-                db,
-                "保存日時の設定"
-            );
+            BindText(stmt, 1, publicToken, db);
+            BindText(stmt, 2, originalName, db);
+            BindText(stmt, 3, contentType, db);
+            CheckResult(sqlite3_bind_blob(stmt, 4, fileBytes, fileBytes.Length, SQLITE_TRANSIENT),
+                db, "画像データの設定");
+            BindText(stmt, 5, DateTime.Now.ToString(
+                "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture), db);
 
             int stepResult = sqlite3_step(stmt);
             if (stepResult != SQLITE_DONE)
             {
-                string busyText = stepResult == SQLITE_BUSY ? "データベースが使用中です。少し待って再試行してください。" : string.Empty;
-                throw new InvalidOperationException(
-                    "画像を保存できませんでした。" + busyText + GetSqliteError(db) +
-                    " (code=" + stepResult + ")"
-                );
+                throw new InvalidOperationException("画像の保存に失敗しました: " + GetSqliteError(db));
             }
 
-            string fileUrl = BuildFileUrl(publicToken);
+            // INSERTが成功したことの追加確認。公開URLには連番IDを使わない。
+            long insertedId = sqlite3_last_insert_rowid(db);
+            if (insertedId <= 0)
+            {
+                throw new InvalidOperationException("保存された画像IDを取得できませんでした。");
+            }
 
+            string fileUrl = ResolveUrl(Request.Path) + "?token=" +
+                HttpUtility.UrlEncode(publicToken);
             Response.StatusCode = 200;
             Response.Write(
-                "{\"success\":true," +
-                "\"fileName\":\"" + JsonEscape(originalName) + "\"," +
-                "\"fileUrl\":\"" + JsonEscape(fileUrl) + "\"}"
-            );
+                "{\"success\":true,\"fileName\":\"" +
+                HttpUtility.JavaScriptStringEncode(originalName) +
+                "\",\"fileUrl\":\"" +
+                HttpUtility.JavaScriptStringEncode(fileUrl) +
+                "\"}");
         }
         catch (Exception ex)
         {
@@ -446,308 +327,201 @@
         }
         finally
         {
-            if (stmt != IntPtr.Zero)
-            {
-                sqlite3_finalize(stmt);
-            }
-            if (db != IntPtr.Zero)
-            {
-                sqlite3_close(db);
-            }
+            if (stmt != IntPtr.Zero) sqlite3_finalize(stmt);
+            if (db != IntPtr.Zero) sqlite3_close(db);
         }
     }
 
     private void ServeFile(string token)
     {
         Response.Clear();
-        Response.TrySkipIisCustomErrors = true;
-        Response.AddHeader("X-Content-Type-Options", "nosniff");
+        Response.Cache.SetCacheability(HttpCacheability.NoCache);
+        Response.Cache.SetNoStore();
 
-        if (!IsValidToken(token))
+        Guid parsedToken;
+        if (token.Length != 32 || !Guid.TryParseExact(token, "N", out parsedToken))
         {
-            SendTextError(404, "画像が見つかりません。");
+            WriteTextError(404, "画像が見つかりません。");
             return;
         }
 
         IntPtr db = IntPtr.Zero;
         IntPtr stmt = IntPtr.Zero;
-
         try
         {
-            db = OpenDatabase();
-
+            CheckResult(OpenDatabase(out db), db, "データベースを開く処理");
             const string sql =
-                "SELECT filename, content_type, file_data " +
-                "FROM PhotoFiles WHERE public_token = ? LIMIT 1;";
-
-            CheckSqlite(
-                sqlite3_prepare_v2(db, sql, -1, out stmt, IntPtr.Zero),
-                db,
-                "画像読込処理の準備"
-            );
-
-            BindText(stmt, 1, token, db, "公開トークン");
+                "SELECT content_type, file_data FROM PhotoFiles WHERE public_token = ?;";
+            CheckResult(sqlite3_prepare_v2(db, sql, -1, out stmt, IntPtr.Zero),
+                db, "画像取得処理の準備");
+            BindText(stmt, 1, token, db);
 
             int stepResult = sqlite3_step(stmt);
             if (stepResult != SQLITE_ROW)
             {
-                SendTextError(404, "画像が見つかりません。");
+                WriteTextError(404, "画像が見つかりません。");
                 return;
             }
 
-            string filename = ReadSqliteText(stmt, 0);
-            string contentType = ReadSqliteText(stmt, 1);
-            byte[] fileData = ReadSqliteBlob(stmt, 2);
-
-            if (fileData == null || fileData.Length == 0)
+            string contentType = ReadSqliteText(stmt, 0);
+            byte[] fileData = ReadSqliteBlob(stmt, 1);
+            if (fileData == null || fileData.Length == 0 ||
+                (contentType != "image/jpeg" && contentType != "image/png"))
             {
-                SendTextError(404, "画像が見つかりません。");
-                return;
-            }
-
-            if (contentType != "image/jpeg" && contentType != "image/png")
-            {
-                SendTextError(415, "対応していない画像形式です。");
+                WriteTextError(404, "画像が見つかりません。");
                 return;
             }
 
             Response.StatusCode = 200;
             Response.ContentType = contentType;
-            Response.Cache.SetCacheability(HttpCacheability.Private);
-            Response.Cache.SetMaxAge(TimeSpan.FromMinutes(10));
-            Response.AddHeader("Content-Disposition", "inline; filename*=UTF-8''" + Uri.EscapeDataString(filename));
-            Response.AddHeader("Content-Length", fileData.Length.ToString(CultureInfo.InvariantCulture));
+            Response.AppendHeader("Content-Disposition", "inline");
+            Response.AppendHeader("Content-Length",
+                fileData.Length.ToString(CultureInfo.InvariantCulture));
             Response.OutputStream.Write(fileData, 0, fileData.Length);
         }
         catch (Exception ex)
         {
             LogError(ex);
-            SendTextError(500, "画像を読み込めませんでした。");
+            WriteTextError(500, "画像を読み込めませんでした。");
         }
         finally
         {
-            if (stmt != IntPtr.Zero)
-            {
-                sqlite3_finalize(stmt);
-            }
-            if (db != IntPtr.Zero)
-            {
-                sqlite3_close(db);
-            }
+            if (stmt != IntPtr.Zero) sqlite3_finalize(stmt);
+            if (db != IntPtr.Zero) sqlite3_close(db);
         }
     }
 
     private void ExecuteSql(IntPtr db, string sql)
     {
-        IntPtr errorMessage = IntPtr.Zero;
-        int result = sqlite3_exec(db, sql, IntPtr.Zero, IntPtr.Zero, out errorMessage);
-
+        IntPtr errorPointer = IntPtr.Zero;
         try
         {
+            int result = sqlite3_exec(db, sql, IntPtr.Zero, IntPtr.Zero, out errorPointer);
             if (result != SQLITE_OK)
             {
-                string message = errorMessage == IntPtr.Zero
+                string message = errorPointer == IntPtr.Zero
                     ? GetSqliteError(db)
-                    : ReadUtf8Pointer(errorMessage, -1);
-
-                throw new InvalidOperationException(
-                    "SQLite SQL実行エラー: " + message + " (code=" + result + ")"
-                );
+                    : ReadUtf8Pointer(errorPointer);
+                throw new InvalidOperationException("SQLite処理に失敗しました: " + message);
             }
         }
         finally
         {
-            if (errorMessage != IntPtr.Zero)
+            if (errorPointer != IntPtr.Zero)
             {
-                sqlite3_free(errorMessage);
+                sqlite3_free(errorPointer);
             }
         }
     }
 
-    private void BindText(IntPtr stmt, int index, string value, IntPtr db, string operation)
+    private void BindText(IntPtr stmt, int index, string value, IntPtr db)
     {
-        byte[] bytes = Encoding.UTF8.GetBytes(value ?? string.Empty);
-        CheckSqlite(
-            sqlite3_bind_text(stmt, index, bytes, bytes.Length, SQLITE_TRANSIENT),
-            db,
-            operation + "の設定"
-        );
+        byte[] bytes = Utf8(value);
+        CheckResult(sqlite3_bind_text(stmt, index, bytes, bytes.Length, SQLITE_TRANSIENT),
+            db, "文字列パラメーターの設定");
     }
 
-    private void CheckSqlite(int result, IntPtr db, string operation)
+    private void CheckResult(int result, IntPtr db, string operation)
     {
         if (result != SQLITE_OK)
         {
+            string detail = db == IntPtr.Zero ? "" : ": " + GetSqliteError(db);
             throw new InvalidOperationException(
-                operation + "に失敗しました。" + GetSqliteError(db) +
-                " (code=" + result + ")"
-            );
+                operation + "に失敗しました（SQLiteコード " +
+                result.ToString(CultureInfo.InvariantCulture) + "）" + detail);
         }
     }
 
     private string GetSqliteError(IntPtr db)
     {
-        if (db == IntPtr.Zero)
-        {
-            return "SQLiteハンドルがありません。";
-        }
-
-        IntPtr ptr = sqlite3_errmsg(db);
-        return ptr == IntPtr.Zero ? "不明なSQLiteエラー" : ReadUtf8Pointer(ptr, -1);
+        if (db == IntPtr.Zero) return "詳細不明";
+        IntPtr pointer = sqlite3_errmsg(db);
+        return pointer == IntPtr.Zero ? "詳細不明" : ReadUtf8Pointer(pointer);
     }
 
-    private string ReadSqliteText(IntPtr stmt, int column)
+    private static string ReadUtf8Pointer(IntPtr pointer)
     {
-        IntPtr ptr = sqlite3_column_text(stmt, column);
-        int length = sqlite3_column_bytes(stmt, column);
-
-        if (ptr == IntPtr.Zero || length <= 0)
+        int length = 0;
+        while (Marshal.ReadByte(pointer, length) != 0)
         {
-            return string.Empty;
+            length++;
         }
-
-        return ReadUtf8Pointer(ptr, length);
-    }
-
-    private byte[] ReadSqliteBlob(IntPtr stmt, int column)
-    {
-        int length = sqlite3_column_bytes(stmt, column);
-        if (length <= 0)
-        {
-            return new byte[0];
-        }
-
-        IntPtr ptr = sqlite3_column_blob(stmt, column);
-        if (ptr == IntPtr.Zero)
-        {
-            return null;
-        }
-
-        byte[] data = new byte[length];
-        Marshal.Copy(ptr, data, 0, length);
-        return data;
-    }
-
-    private string ReadUtf8Pointer(IntPtr ptr, int knownLength)
-    {
-        int length = knownLength;
-
-        if (length < 0)
-        {
-            length = 0;
-            while (Marshal.ReadByte(ptr, length) != 0)
-            {
-                length++;
-            }
-        }
-
-        if (length == 0)
-        {
-            return string.Empty;
-        }
-
         byte[] bytes = new byte[length];
-        Marshal.Copy(ptr, bytes, 0, length);
+        if (length > 0) Marshal.Copy(pointer, bytes, 0, length);
         return Encoding.UTF8.GetString(bytes);
     }
 
-    private byte[] Utf8NullTerminated(string value)
+    private static byte[] Utf8(string value)
     {
-        byte[] text = Encoding.UTF8.GetBytes(value);
-        byte[] result = new byte[text.Length + 1];
-        Buffer.BlockCopy(text, 0, result, 0, text.Length);
-        result[result.Length - 1] = 0;
-        return result;
+        return Encoding.UTF8.GetBytes(value ?? String.Empty);
     }
 
-    private byte[] ReadAllBytes(Stream input, int maxBytes)
+    private static byte[] ReadAllBytes(Stream input, int maximumLength)
     {
         using (MemoryStream output = new MemoryStream())
         {
             byte[] buffer = new byte[81920];
             int total = 0;
             int read;
-
             while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
             {
                 total += read;
-                if (total > maxBytes)
+                if (total > maximumLength)
                 {
                     throw new InvalidOperationException("ファイルサイズが上限を超えています。");
                 }
                 output.Write(buffer, 0, read);
             }
-
             return output.ToArray();
         }
     }
 
-    private string DetectImageContentType(byte[] data)
+    private static string DetectImageContentType(byte[] data)
     {
-        if (data == null || data.Length < 8)
-        {
-            return null;
-        }
-
+        if (data == null || data.Length < 8) return null;
         if (data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF)
-        {
             return "image/jpeg";
-        }
-
-        if (data[0] == 0x89 &&
-            data[1] == 0x50 &&
-            data[2] == 0x4E &&
-            data[3] == 0x47 &&
-            data[4] == 0x0D &&
-            data[5] == 0x0A &&
-            data[6] == 0x1A &&
-            data[7] == 0x0A)
-        {
+        if (data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E &&
+            data[3] == 0x47 && data[4] == 0x0D && data[5] == 0x0A &&
+            data[6] == 0x1A && data[7] == 0x0A)
             return "image/png";
-        }
-
         return null;
     }
 
-    private bool IsValidToken(string token)
+    private static string SanitizeFileName(string suppliedName, string contentType)
     {
-        if (string.IsNullOrEmpty(token) || token.Length != 32)
+        string name = Path.GetFileName(suppliedName ?? String.Empty);
+        foreach (char invalid in Path.GetInvalidFileNameChars())
         {
-            return false;
+            name = name.Replace(invalid, '_');
         }
-
-        for (int i = 0; i < token.Length; i++)
+        if (String.IsNullOrWhiteSpace(name))
         {
-            char c = token[i];
-            bool isHex =
-                (c >= '0' && c <= '9') ||
-                (c >= 'a' && c <= 'f') ||
-                (c >= 'A' && c <= 'F');
-
-            if (!isHex)
-            {
-                return false;
-            }
+            name = contentType == "image/png" ? "image.png" : "image.jpg";
         }
-
-        return true;
+        if (name.Length > 200) name = name.Substring(0, 200);
+        return name;
     }
 
-    private string BuildFileUrl(string token)
+    private static string ReadSqliteText(IntPtr stmt, int column)
     {
-        string path = Request.Url.AbsolutePath;
-        return path + "?token=" + HttpUtility.UrlEncode(token);
+        IntPtr pointer = sqlite3_column_text(stmt, column);
+        int length = sqlite3_column_bytes(stmt, column);
+        if (pointer == IntPtr.Zero || length <= 0) return String.Empty;
+        byte[] data = new byte[length];
+        Marshal.Copy(pointer, data, 0, length);
+        return Encoding.UTF8.GetString(data);
     }
 
-    private long ToUnixTimeSeconds(DateTime localDateTime)
+    private static byte[] ReadSqliteBlob(IntPtr stmt, int column)
     {
-        DateTimeOffset dto = new DateTimeOffset(localDateTime);
-        return dto.ToUnixTimeSeconds();
-    }
-
-    private string JsonEscape(string value)
-    {
-        return HttpUtility.JavaScriptStringEncode(value ?? string.Empty);
+        IntPtr pointer = sqlite3_column_blob(stmt, column);
+        int length = sqlite3_column_bytes(stmt, column);
+        if (length <= 0) return new byte[0];
+        if (pointer == IntPtr.Zero) return null;
+        byte[] data = new byte[length];
+        Marshal.Copy(pointer, data, 0, length);
+        return data;
     }
 
     private void WriteJsonError(int statusCode, string message)
@@ -758,346 +532,168 @@
         Response.ContentType = "application/json; charset=utf-8";
         Response.Cache.SetCacheability(HttpCacheability.NoCache);
         Response.Cache.SetNoStore();
-        Response.AddHeader("X-Content-Type-Options", "nosniff");
-        Response.Write(
-            "{\"success\":false,\"message\":\"" + JsonEscape(message) + "\"}"
-        );
+        Response.Write("{\"success\":false,\"message\":\"" +
+            HttpUtility.JavaScriptStringEncode(message) + "\"}");
     }
 
-    private void SendTextError(int statusCode, string message)
+    private void WriteTextError(int statusCode, string message)
     {
         Response.Clear();
         Response.StatusCode = statusCode;
         Response.TrySkipIisCustomErrors = true;
         Response.ContentType = "text/plain; charset=utf-8";
-        Response.Cache.SetCacheability(HttpCacheability.NoCache);
-        Response.Cache.SetNoStore();
-        Response.AddHeader("X-Content-Type-Options", "nosniff");
         Response.Write(message);
     }
 
-    private void LogError(Exception ex)
+    private void LogError(Exception exception)
     {
         try
         {
-            string appDataPath = Server.MapPath("~/App_Data");
-            Directory.CreateDirectory(appDataPath);
-            string logPath = Path.Combine(appDataPath, "photo_share_error.log");
-            string line =
-                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) +
-                "\t" + ex.ToString() + Environment.NewLine;
-            File.AppendAllText(logPath, line, Encoding.UTF8);
+            string path = Server.MapPath("~/App_Data/photo_share_error.log");
+            string entry = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) +
+                " " + exception.ToString() + Environment.NewLine;
+            File.AppendAllText(path, entry, Encoding.UTF8);
         }
         catch
         {
-            // ログ書込み失敗を利用者への応答に波及させない。
+            // ログ書き込み失敗で元のエラー処理を妨げない。
         }
     }
 </script>
 
 <!DOCTYPE html>
 <html lang="ja">
-<head runat="server">
+<head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-    <title>写真共有</title>
+    <title>写真撮影・SQLite保存</title>
     <style>
-        * {
-            box-sizing: border-box;
-            -webkit-tap-highlight-color: transparent;
-        }
-
-        html, body {
-            min-height: 100%;
-        }
-
+        * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
-            background-color: #f2f2f7;
-            color: #1c1c1e;
-            margin: 0;
+            background: #f2f2f7; color: #1c1c1e; margin: 0;
             padding: calc(20px + env(safe-area-inset-top)) 16px calc(20px + env(safe-area-inset-bottom));
-            display: flex;
-            justify-content: center;
-            align-items: flex-start;
-            min-height: 100vh;
+            display: flex; justify-content: center; align-items: flex-start; min-height: 100vh;
         }
-
         .upload-card {
-            background: #ffffff;
-            width: 100%;
-            max-width: 500px;
-            padding: 24px;
-            border-radius: 16px;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.06);
+            background: #fff; width: 100%; max-width: 500px; padding: 24px;
+            border-radius: 16px; box-shadow: 0 4px 20px rgba(0,0,0,.06);
         }
-
-        h1 {
-            margin: 0 0 20px 0;
-            font-size: 1.25rem;
-            font-weight: 700;
-            text-align: center;
-        }
-
-        .action-group {
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-            margin-bottom: 20px;
-        }
-
+        h2 { margin: 0 0 20px; font-size: 1.25rem; text-align: center; }
+        .action-group { display: flex; flex-direction: column; gap: 12px; margin-bottom: 20px; }
         .btn-touch {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-            width: 100%;
-            min-height: 54px;
-            padding: 10px 14px;
-            border-radius: 12px;
-            font-size: 1.05rem;
-            font-weight: 600;
-            border: none;
-            cursor: pointer;
-            touch-action: manipulation;
-            transition: opacity 0.2s, transform 0.1s;
+            display: flex; align-items: center; justify-content: center; gap: 8px;
+            width: 100%; min-height: 54px; border-radius: 12px; font-size: 1.05rem;
+            font-weight: 600; border: 0; cursor: pointer;
         }
-
-        .btn-touch:active {
-            opacity: 0.75;
-            transform: scale(0.98);
-        }
-
-        .btn-touch:disabled {
-            opacity: 0.5;
-            cursor: default;
-            transform: none;
-        }
-
-        .btn-camera {
-            background-color: #007aff;
-            color: #ffffff;
-        }
-
-        .btn-library {
-            background-color: #e5e5ea;
-            color: #007aff;
-        }
-
-        .file-input {
-            display: none;
-        }
-
-        #resultArea {
-            margin-top: 15px;
-        }
-
-        .status-msg {
-            padding: 14px;
-            border-radius: 10px;
-            font-size: 0.95rem;
-            text-align: center;
-            font-weight: 500;
-            overflow-wrap: anywhere;
-        }
-
+        .btn-touch:active { opacity: .75; transform: scale(.98); }
+        .btn-touch:disabled { opacity: .5; cursor: default; transform: none; }
+        .btn-camera { background: #007aff; color: #fff; }
+        .btn-library { background: #e5e5ea; color: #007aff; }
+        .file-input { display: none; }
+        #resultArea { margin-top: 15px; }
+        .status-msg { padding: 14px; border-radius: 10px; font-size: .95rem; text-align: center; font-weight: 500; }
         .status-msg.success { background: #d1e7dd; color: #0f5132; }
         .status-msg.error { background: #f8d7da; color: #842029; }
         .status-msg.info { background: #e2e3e5; color: #41464b; }
-
-        .preview-container {
-            margin-top: 15px;
-            text-align: center;
-        }
-
-        .preview-img {
-            display: block;
-            width: auto;
-            max-width: 100%;
-            max-height: 60vh;
-            margin: 0 auto;
-            border-radius: 12px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            object-fit: contain;
-        }
-
-        .note {
-            margin: 14px 0 0;
-            color: #6e6e73;
-            font-size: 0.82rem;
-            line-height: 1.5;
-            text-align: center;
-        }
+        .preview-container { margin-top: 15px; text-align: center; }
+        .preview-img { max-width: 100%; max-height: 380px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,.1); object-fit: contain; }
     </style>
 </head>
 <body>
     <main class="upload-card">
-        <h1>写真共有</h1>
-
+        <h2>写真撮影・SQLite保存</h2>
         <div class="action-group">
-            <button type="button" class="btn-touch btn-camera" id="cameraButton">
-                📷 その場で写真を撮影
-            </button>
-
-            <button type="button" class="btn-touch btn-library" id="libraryButton">
-                🖼️ アルバムから選択
-            </button>
-
+            <button type="button" class="btn-touch btn-camera" id="cameraButton">📷 その場で写真を撮影</button>
+            <button type="button" class="btn-touch btn-library" id="libraryButton">🖼️ アルバムから選択</button>
             <input type="file" id="cameraInput" class="file-input" accept="image/jpeg,image/png" capture="environment" />
             <input type="file" id="libraryInput" class="file-input" accept="image/jpeg,image/png" />
         </div>
-
         <div id="resultArea" aria-live="polite"></div>
-        <p class="note">JPEG・PNG、15MB以下。画像は翌日になると自動削除されます。</p>
     </main>
-
     <script>
         (function () {
-            'use strict';
-
-            var cameraInput = document.getElementById('cameraInput');
-            var libraryInput = document.getElementById('libraryInput');
-            var cameraButton = document.getElementById('cameraButton');
-            var libraryButton = document.getElementById('libraryButton');
-            var resultArea = document.getElementById('resultArea');
+            "use strict";
+            var cameraInput = document.getElementById("cameraInput");
+            var libraryInput = document.getElementById("libraryInput");
+            var cameraButton = document.getElementById("cameraButton");
+            var libraryButton = document.getElementById("libraryButton");
+            var resultArea = document.getElementById("resultArea");
             var uploading = false;
-            var maxFileSize = 15 * 1024 * 1024;
 
-            cameraButton.addEventListener('click', function () {
-                if (!uploading) {
-                    cameraInput.click();
-                }
-            });
+            cameraButton.addEventListener("click", function () { cameraInput.click(); });
+            libraryButton.addEventListener("click", function () { libraryInput.click(); });
+            cameraInput.addEventListener("change", function () { selectFile(cameraInput); });
+            libraryInput.addEventListener("change", function () { selectFile(libraryInput); });
 
-            libraryButton.addEventListener('click', function () {
-                if (!uploading) {
-                    libraryInput.click();
-                }
-            });
-
-            cameraInput.addEventListener('change', function () {
-                handleFileSelect(cameraInput);
-            });
-
-            libraryInput.addEventListener('change', function () {
-                handleFileSelect(libraryInput);
-            });
-
-            function handleFileSelect(inputElement) {
-                if (inputElement.files && inputElement.files.length > 0) {
-                    uploadFile(inputElement.files[0]);
-                }
+            function selectFile(input) {
+                if (input.files && input.files.length > 0) uploadFile(input.files[0]);
             }
 
-            function uploadFile(file) {
-                if (uploading || !file) {
-                    return;
-                }
-
-                if (file.size <= 0) {
-                    showStatus('ファイルデータが空です。', 'error');
-                    resetInputs();
-                    return;
-                }
-
-                if (file.size > maxFileSize) {
-                    showStatus('画像は15MB以下にしてください。', 'error');
-                    resetInputs();
-                    return;
-                }
-
-                uploading = true;
-                setButtonsDisabled(true);
-                showStatus('SQLiteへ保存中...', 'info');
-
-                var formData = new FormData();
-                formData.append('file', file, file.name || 'image.jpg');
-
-                fetch(window.location.pathname, {
-                    method: 'POST',
-                    body: formData,
-                    credentials: 'same-origin',
-                    cache: 'no-store'
-                })
-                .then(function (response) {
-                    return response.text().then(function (text) {
-                        var data;
-                        try {
-                            data = JSON.parse(text);
-                        } catch (parseError) {
-                            throw new Error('サーバーから正しい応答が返されませんでした。');
-                        }
-
-                        if (!response.ok || !data.success) {
-                            throw new Error(data.message || '保存に失敗しました。');
-                        }
-
-                        return data;
-                    });
-                })
-                .then(function (data) {
-                    showSuccess(data.fileUrl);
-                })
-                .catch(function (error) {
-                    if (window.console && console.error) {
-                        console.error('Upload Error:', error);
-                    }
-                    showStatus(error.message || '送信中にエラーが発生しました。', 'error');
-                })
-                .then(function () {
-                    uploading = false;
-                    setButtonsDisabled(false);
-                    resetInputs();
-                });
-            }
-
-            function showSuccess(fileUrl) {
-                clearResultArea();
-
-                var status = document.createElement('div');
-                status.className = 'status-msg success';
-                status.textContent = 'SQLiteデータベースへ保存しました。';
-
-                var previewContainer = document.createElement('div');
-                previewContainer.className = 'preview-container';
-
-                var image = document.createElement('img');
-                image.src = fileUrl;
-                image.className = 'preview-img';
-                image.alt = '保存した画像';
-
-                image.addEventListener('error', function () {
-                    showStatus('保存しましたが、画像の表示に失敗しました。', 'error');
-                });
-
-                previewContainer.appendChild(image);
-                resultArea.appendChild(status);
-                resultArea.appendChild(previewContainer);
-            }
-
-            function showStatus(message, type) {
-                clearResultArea();
-
-                var status = document.createElement('div');
-                status.className = 'status-msg ' + type;
-                status.textContent = message;
-                resultArea.appendChild(status);
-            }
-
-            function clearResultArea() {
-                while (resultArea.firstChild) {
-                    resultArea.removeChild(resultArea.firstChild);
-                }
-            }
-
-            function setButtonsDisabled(disabled) {
+            function setDisabled(disabled) {
                 cameraButton.disabled = disabled;
                 libraryButton.disabled = disabled;
             }
 
-            function resetInputs() {
-                cameraInput.value = '';
-                libraryInput.value = '';
+            function showStatus(message, type) {
+                resultArea.textContent = "";
+                var status = document.createElement("div");
+                status.className = "status-msg " + type;
+                status.textContent = message;
+                resultArea.appendChild(status);
+            }
+
+            function uploadFile(file) {
+                if (uploading || !file) return;
+                if (file.size > 15 * 1024 * 1024) {
+                    showStatus("画像は15MB以下にしてください。", "error");
+                    return;
+                }
+
+                uploading = true;
+                setDisabled(true);
+                showStatus("SQLiteへ保存中...", "info");
+
+                var formData = new FormData();
+                formData.append("file", file, file.name);
+                var request = new XMLHttpRequest();
+                request.open("POST", window.location.pathname, true);
+                request.setRequestHeader("Accept", "application/json");
+                request.onreadystatechange = function () {
+                    if (request.readyState !== 4) return;
+                    try {
+                        var data = JSON.parse(request.responseText);
+                        if (request.status < 200 || request.status >= 300 || !data.success) {
+                            throw new Error(data.message || "保存に失敗しました。");
+                        }
+                        resultArea.textContent = "";
+                        var status = document.createElement("div");
+                        status.className = "status-msg success";
+                        status.textContent = "SQLiteデータベースへ保存完了";
+                        var preview = document.createElement("div");
+                        preview.className = "preview-container";
+                        var image = document.createElement("img");
+                        image.src = data.fileUrl;
+                        image.className = "preview-img";
+                        image.alt = "DB保存画像";
+                        preview.appendChild(image);
+                        resultArea.appendChild(status);
+                        resultArea.appendChild(preview);
+                    } catch (error) {
+                        showStatus(error.message || "送信中にエラーが発生しました。", "error");
+                    } finally {
+                        uploading = false;
+                        setDisabled(false);
+                        cameraInput.value = "";
+                        libraryInput.value = "";
+                    }
+                };
+                request.onerror = function () {
+                    showStatus("サーバーへ接続できませんでした。", "error");
+                    uploading = false;
+                    setDisabled(false);
+                };
+                request.send(formData);
             }
         }());
     </script>
