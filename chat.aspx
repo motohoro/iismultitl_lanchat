@@ -29,7 +29,7 @@ public class ThreadModel {
 private static readonly object _fileLock = new object();
 
 private string GetFilePath() {
-    return Server.MapPath("~/App_Data/chat.json");
+    return Server.MapPath("App_Data/chat.json");
 }
 
 private List<ThreadModel> LoadAndCleanupData() {
