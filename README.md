@@ -37,7 +37,7 @@ Windows の IIS (Internet Information Services) + ASP.NET 環境で動作する�
 2. **ネットワークプロファイル**: Windowsの設定から、接続中のWi-Fi/イーサネットのプロファイルを **「プライベート ネットワーク」** に設定します。
 
 ### 3. ファイルの配置
-本リポジトリの `chat.aspx` を以下のフォルダに配置します。
-
+本リポジトリの `chat.aspx` と.`chat.aspx` を以下のフォルダに配置します。
+そのフォルダにApp_Dataというフォルダを作り、フォルダのプロパティ（セキュリティ設定）からIIS_IUSRSに書き込み許可を与えてください
 ```text
 C:\inetpub\wwwroot\chat.aspx
