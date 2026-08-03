@@ -143,7 +143,11 @@ protected void Page_Load(object sender, EventArgs e) {
 <title>SMS風 掲示板</title>
 <style>
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 12px; background-color: #f2f2f7; color: #000; overflow-x: hidden; }
-.control-panel { background: #fff; border-radius: 12px; padding: 10px 15px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; font-size: 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+.control-panel { background: #fff; border-radius: 12px; padding: 10px 15px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; font-size: 13px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); gap: 8px; flex-wrap: wrap; }
+.control-right { display: flex; align-items: center; gap: 10px; }
+.reset-btn { background: #e9e9eb; color: #333; border: none; padding: 5px 10px; border-radius: 8px; font-size: 12px; cursor: pointer; font-weight: bold; }
+.reset-btn:active { background: #d1d1d6; }
+
 .post-card { background: #fff; border-radius: 16px; padding: 16px 12px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); text-align: center; }
 .camera-btn { display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; padding: 18px 0; background: #007aff; color: #fff; font-weight: bold; font-size: 18px; border-radius: 14px; box-sizing: border-box; cursor: pointer; box-shadow: 0 4px 10px rgba(0, 122, 255, 0.3); border: none; }
 .camera-btn:active { background: #0056b3; transform: scale(0.98); }
@@ -190,13 +194,27 @@ input[type="file"] { display: none; }
 }
 .modal-overlay img { max-width: 95%; max-height: 90vh; border-radius: 8px; object-fit: contain; }
 .modal-close-hint { position: absolute; top: 20px; color: #fff; font-size: 14px; background: rgba(0,0,0,0.5); padding: 6px 12px; border-radius: 20px; }
+
+/* Undo (元に戻す) トースト */
+.undo-toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.85); color: #fff; padding: 10px 18px; border-radius: 25px;
+    font-size: 14px; display: flex; align-items: center; gap: 12px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3); z-index: 10000;
+    opacity: 0; pointer-events: none; transition: opacity 0.3s ease;
+}
+.undo-toast.show { opacity: 1; pointer-events: auto; }
+.undo-btn { background: #007aff; color: #fff; border: none; padding: 4px 10px; border-radius: 12px; font-weight: bold; cursor: pointer; font-size: 12px; }
 </style>
 </head>
 <body>
 
 <div class="control-panel">
     <strong id="audio-status">🔊 通知音: 画面タップで有効化</strong>
-    <label><input type="checkbox" id="mute-toggle"> 消音</label>
+    <div class="control-right">
+        <button class="reset-btn" onclick="resetArchive()">🔄 非表示をリセット</button>
+        <label><input type="checkbox" id="mute-toggle"> 消音</label>
+    </div>
 </div>
 
 <div class="post-card">
@@ -216,6 +234,11 @@ input[type="file"] { display: none; }
     <img id="modal-img" src="" alt="拡大画像">
 </div>
 
+<div id="undo-toast" class="undo-toast">
+    <span>非表示にしました</span>
+    <button class="undo-btn" onclick="undoArchive()">元に戻す</button>
+</div>
+
 <audio id="notify-sound" preload="auto">
     <source src="notification.mp3" type="audio/mpeg">
 </audio>
@@ -226,6 +249,9 @@ const knownThreadIds = new Set();
 const knownReplyIds = new Set();
 let isFirstLoad = true;
 let audioUnlocked = false;
+let pendingUndoThreadId = null;
+let undoTimer = null;
+
 const sound = document.getElementById('notify-sound');
 const audioStatus = document.getElementById('audio-status');
 const cameraInput = document.getElementById('camera-input');
@@ -322,6 +348,52 @@ function closeImageModal() {
     document.getElementById('image-modal').style.display = 'none';
 }
 
+function showUndoToast(threadId) {
+    pendingUndoThreadId = threadId;
+    const toast = document.getElementById('undo-toast');
+    toast.classList.add('show');
+    if (undoTimer) clearTimeout(undoTimer);
+    undoTimer = setTimeout(() => {
+        hideUndoToast();
+    }, 5000);
+}
+
+function hideUndoToast() {
+    const toast = document.getElementById('undo-toast');
+    toast.classList.remove('show');
+    pendingUndoThreadId = null;
+}
+
+function undoArchive() {
+    if (!pendingUndoThreadId) return;
+    const bubble = document.getElementById(`thread-bubble-${pendingUndoThreadId}`);
+    if (bubble) {
+        bubble.classList.remove('archived');
+        bubble.style.transform = 'translateX(0)';
+        bubble.style.opacity = '1';
+    }
+    localStorage.removeItem('archive_' + pendingUndoThreadId);
+    hideUndoToast();
+}
+
+function resetArchive() {
+    if (!confirm('非表示にしたスレッドをすべて再表示しますか？')) return;
+    
+    // localStorage から非表示フラグを全削除
+    Object.keys(localStorage).forEach(key => {
+        if (key.startsWith('archive_')) {
+            localStorage.removeItem(key);
+        }
+    });
+
+    // 画面上の全バブルの非表示を解除
+    document.querySelectorAll('.chat-bubble.archived').forEach(bubble => {
+        bubble.classList.remove('archived');
+        bubble.style.transform = 'translateX(0)';
+        bubble.style.opacity = '1';
+    });
+}
+
 function attachSwipeToArchive(element, threadId) {
     if (localStorage.getItem('archive_' + threadId) === 'true') {
         element.classList.add('archived');
@@ -357,6 +429,7 @@ function attachSwipeToArchive(element, threadId) {
             setTimeout(() => {
                 element.classList.add('archived');
                 localStorage.setItem('archive_' + threadId, 'true');
+                showUndoToast(threadId);
             }, 200);
         } else {
             element.style.transform = 'translateX(0)';
